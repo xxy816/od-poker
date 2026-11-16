@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OD POKER - 进入游戏</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .login-container {
+            background: white;
+            padding: 2rem;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .login-header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .login-header h1 {
+            color: #333;
+            margin-bottom: 0.5rem;
+        }
+
+        .login-header p {
+            color: #666;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: #333;
+            font-weight: bold;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 0.75rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .error-message {
+            background: #fee;
+            color: #c33;
+            padding: 0.75rem;
+            border-radius: 5px;
+            margin-bottom: 1rem;
+            text-align: center;
+        }
+
+        .success-message {
+            background: #efe;
+            color: #2a7;
+            padding: 0.75rem;
+            border-radius: 5px;
+            margin-bottom: 1rem;
+            text-align: center;
+        }
+
+        .hint {
+            margin-top: 1rem;
+            text-align: center;
+            color: #999;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-header">
+            <h1>🃏 OD POKER</h1>
+            <p>输入用户名即可进入游戏</p>
+        </div>
+
+        <div id="message"></div>
+
+        <form id="enterForm">
+            <div class="form-group">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" maxlength="20" placeholder="2-20 个字符" required autofocus>
+            </div>
+
+            <button type="submit" class="btn" id="enterBtn">进入游戏</button>
+        </form>
+
+        <p class="hint">首次使用的用户名会自动创建账号并赠送 1000 筹码</p>
+    </div>
+
+    <script>
+        const API_BASE = '/api';
+
+        const form = document.getElementById('enterForm');
+        const input = document.getElementById('username');
+        const btn = document.getElementById('enterBtn');
+        const messageDiv = document.getElementById('message');
+
+        function showMessage(message, type = 'error') {
+            messageDiv.innerHTML = `<div class="${type}-message">${message}</div>`;
+            setTimeout(() => {
+                messageDiv.innerHTML = '';
+            }, 4000);
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const username = input.value.trim();
+            if (username.length < 2 || username.length > 20) {
+                showMessage('用户名长度需为 2-20 个字符');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = '进入中...';
+
+            try {
+                const response = await fetch(`${API_BASE}/auth/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ username })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    localStorage.setItem('token', result.token);
+                    localStorage.setItem('user', JSON.stringify(result.user));
+
+                    showMessage(result.isNewUser ? '账号已创建，正在进入...' : '登录成功，正在进入...', 'success');
+
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 600);
+                } else {
+                    showMessage(result.error || '进入失败，请重试');
+                }
+            } catch (error) {
+                console.error('进入游戏失败:', error);
+                showMessage('网络错误，请稍后重试');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '进入游戏';
+            }
+        });
+    </script>
+</body>
+</html>
