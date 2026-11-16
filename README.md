@@ -13,6 +13,10 @@ AI编程学习，整着玩
 - **四轮下注**：Pre-flop、Flop、Turn、River完整流程
 - **丰富操作**：弃牌、过牌、跟注、加注、全下等操作
 - **输光补码**：输光筹码不会被移出房间，可选择补码 1000-10000 继续游戏；补码的钱从钱包扣除，钱包余额允许为负（欠款在离开房间时用房间筹码抵扣）
+- **规则校验**：非法操作（过牌但需跟注、加注低于最小额、抢行动、全下后再行动等）会被服务端拒绝并给出原因，不会静默失败
+- **最小加注与短全下**：最小加注额跟随上一轮加注额；不足一个完整加注的全下不会重新打开下注轮
+- **单挑盲注**：两人对局时按钮位即小盲，翻牌前由按钮（小盲）先行动
+- **行动提醒**：轮到某人行动超过 30 秒会提醒一次，只提醒不自动弃牌（朋友局体验）
 
 
 ## 安装部署
@@ -141,7 +145,7 @@ netsh advfirewall firewall add rule name="Poker UDP" dir=in action=allow protoco
 ```javascript
 // 端口设置
 const SERVER_PORT = process.env.PORT || 3000;
-const BROADCAST_PORT = 8889;
+const BROADCAST_PORT = 41234;
 
 // 房间设置
 const DEFAULT_SETTINGS = {
@@ -150,6 +154,9 @@ const DEFAULT_SETTINGS = {
     bigBlind: 20,
     maxPlayers: 10
 };
+
+// 行动提醒时长（毫秒，默认 30000，只提醒不强制行动）
+const TURN_REMINDER_MS = parseInt(process.env.TURN_REMINDER_MS, 10) || 30000;
 ```
 
 ### 客户端设置
@@ -158,6 +165,7 @@ const DEFAULT_SETTINGS = {
 - **音效开关**：启用/禁用操作音效
 - **动画速度**：慢/正常/快
 - **卡牌主题**：经典/现代/简约
+
 
 ## 核心算法
 
@@ -275,6 +283,7 @@ npm run setup-mongo    # 首次使用：下载便携版 MongoDB
 npm run migrate-db     # 升级旧数据库索引（users / roombalances）
 npm run test:pots      # 奖池分配单元测试（边池、平分余数、筹码守恒）
 npm run test:rebuy     # 补码功能集成测试（自动启动独立测试服务端与临时数据库）
+npm run test:rules     # 牌局规则集成测试（盲注位置、过牌/加注校验、提醒、弃牌轮转）
 ```
 
 ### 扩展功能

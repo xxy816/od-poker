@@ -1,4 +1,15 @@
 // 游戏客户端主文件
+
+// 防止昵称/房间名注入 HTML
+function escapeHtml(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 class PokerGame {
     constructor() {
         this.socket = null;
@@ -76,7 +87,7 @@ class PokerGame {
             if (userInfoDiv) {
                 userInfoDiv.innerHTML = `
                     <div class="user-details">
-                        <span class="username">用户: ${this.currentUser.username}</span>
+                        <span class="username">用户: ${escapeHtml(this.currentUser.username)}</span>
                         <span class="chips">筹码: ${this.currentUser.totalChips}</span>
                         <button id="logoutBtn" class="logout-btn">退出登录</button>
                     </div>
@@ -441,6 +452,18 @@ class PokerGame {
             }
         });
 
+        // 服务端拒绝非法操作（过牌/加注/跟注不合规等）
+        this.socket.on('actionRejected', (data) => {
+            this.showToast((data && data.reason) || '操作无效', 'error');
+        });
+
+        // 30 秒行动提醒（只提示，不自动弃牌/过牌）
+        this.socket.on('actionReminder', (data) => {
+            if (data && data.message) {
+                this.showToast(data.message, 'info');
+            }
+        });
+
         // 房间更新事件
         this.socket.on('roomUpdate', (data) => {
             if (data.message) {
@@ -801,7 +824,7 @@ class PokerGame {
             
             roomItem.innerHTML = `
                 <div class="room-info">
-                    <div class="room-name">${room.name}</div>
+                    <div class="room-name">${escapeHtml(room.name)}</div>
                     <div class="room-details">
                         房间号: ${room.code} | 玩家: ${room.players}/${room.maxPlayers}
                         <span class="room-status ${statusClass}">${statusText}</span>
@@ -865,7 +888,7 @@ class PokerGame {
             
             playerItem.innerHTML = `
                 <div>
-                    <div class="player-name">${player.name}</div>
+                    <div class="player-name">${escapeHtml(player.name)}</div>
                     <div class="player-status">
                         ${statusText}
                     </div>
@@ -974,7 +997,7 @@ class PokerGame {
                 } else if (action === 'raise') {
                     // 加注操作 - 只有筹码足够时才进行本地更新
                     const callAmount = Math.max(0, this.gameState.currentBet - currentPlayer.bet);
-                    const minRaiseAmount = this.gameState.bigBlind || 20; // 使用游戏设置的大盲注
+                    const minRaiseAmount = this.gameState.lastRaiseSize || this.gameState.bigBlind || 20; // 使用游戏设置的大盲注
                     const minTotalAmount = callAmount + minRaiseAmount;
                     
                     if (currentPlayer.chips >= minTotalAmount && amount >= minTotalAmount) {
@@ -1084,7 +1107,7 @@ class PokerGame {
         
         // 获取玩家状态显示
         const statusDisplay = this.getPlayerStatusDisplay(player);
-        const playerNameWithMe = player.id === this.socket.id ? `${player.name} (我)` : player.name;
+        const playerNameWithMe = player.id === this.socket.id ? `${escapeHtml(player.name)} (我)` : escapeHtml(player.name);
         
         // 显示玩家信息
         seatContent.innerHTML = `
@@ -1147,9 +1170,13 @@ class PokerGame {
         const logMessage = document.createElement('div');
         logMessage.className = `log-message ${type}`;
         
-        // 如果有游戏阶段，创建带样式的HTML结构
+            // 如果有游戏阶段，创建带样式的结构（消息可能含玩家昵称，必须用文本节点）
         if (stagePrefix) {
-            logMessage.innerHTML = `<span class="stage-prefix">${stagePrefix}</span> ${message}`;
+            const prefix = document.createElement('span');
+            prefix.className = 'stage-prefix';
+            prefix.textContent = stagePrefix;
+            logMessage.appendChild(prefix);
+            logMessage.appendChild(document.createTextNode(` ${message}`));
         } else {
             logMessage.textContent = message;
         }
@@ -1403,17 +1430,19 @@ class PokerGame {
             const betSlider = document.getElementById('betSlider');
             const betAmount = document.getElementById('betAmount');
             
+            const callAmount = Math.max(0, this.gameState.currentBet - currentPlayer.bet);
+            const minRaiseSize = this.gameState.lastRaiseSize || this.gameState.bigBlind || 20;
             betSlider.max = currentPlayer.chips;
-            betSlider.min = Math.max(0, this.gameState.currentBet - currentPlayer.bet);
+            // 滑块下限：能加注时至少到最小加注额，筹码不足时退化为跟注额
+            betSlider.min = Math.min(currentPlayer.chips, callAmount + minRaiseSize);
             
             // 更新按钮文本
-            const callAmount = Math.max(0, this.gameState.currentBet - currentPlayer.bet);
             document.getElementById('callBtn').textContent = callAmount > 0 ? `跟注 ${callAmount}` : '跟注';
             
             // 检查按钮可用性
             document.getElementById('checkBtn').disabled = callAmount > 0;
             document.getElementById('callBtn').disabled = callAmount <= 0 || currentPlayer.chips < callAmount;
-            const minRaiseAmount = this.gameState.bigBlind || 20;
+            const minRaiseAmount = this.gameState.lastRaiseSize || this.gameState.bigBlind || 20;
             document.getElementById('raiseBtn').disabled = currentPlayer.chips < Math.max(0, callAmount) + minRaiseAmount;
             
             // 如果筹码不足跟注，只能全下

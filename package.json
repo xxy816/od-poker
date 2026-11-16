@@ -11,6 +11,7 @@
     "migrate-db": "node scripts/migrateDb.js",
     "test:pots": "node scripts/testPots.js",
     "test:rebuy": "node scripts/testRebuy.js",
+    "test:rules": "node scripts/testRules.js",
     "setup-mongo": "powershell -ExecutionPolicy Bypass -File scripts/setup-mongo.ps1",
     "db": "node scripts/mongo.js start",
     "db:status": "node scripts/mongo.js status",

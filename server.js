@@ -144,6 +144,85 @@ function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+// 行动提醒：30 秒只提醒，不强制弃牌/过牌（朋友局体验优先）
+const TURN_REMINDER_MS = parseInt(process.env.TURN_REMINDER_MS, 10) || 30000;
+
+// 房间级定时器统一登记，房间销毁时一起清理
+function scheduleRoomTask(room, fn, delay) {
+  if (!room) return null;
+  if (!(room.timers instanceof Set)) room.timers = new Set();
+  const timer = setTimeout(() => {
+    room.timers.delete(timer);
+    if (rooms.get(room.code) !== room) return;
+    try {
+      fn();
+    } catch (error) {
+      console.error(`房间 ${room.code} 定时任务执行失败:`, error);
+    }
+  }, delay);
+  room.timers.add(timer);
+  return timer;
+}
+
+function clearRoomTasks(room) {
+  if (!room) return;
+  if (room.timers instanceof Set) {
+    room.timers.forEach(timer => clearTimeout(timer));
+    room.timers.clear();
+  }
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
+  }
+  room.currentPlayerId = null;
+  room.turnDeadline = null;
+}
+
+function destroyRoom(room) {
+  if (!room) return;
+  clearRoomTasks(room);
+  rooms.delete(room.code);
+}
+
+// 开启本回合的 30 秒提醒（只提醒一次，不改变牌局状态）
+function startTurnReminder(room) {
+  stopTurnReminder(room);
+  if (!room || !room.currentPlayerId) return;
+  const player = room.players.get(room.currentPlayerId);
+  if (!player) return;
+  room.turnDeadline = Date.now() + TURN_REMINDER_MS;
+  room.turnTimer = scheduleRoomTask(room, () => {
+    if (room.currentPlayerId !== player.id) return;
+    if (room.gameState === GAME_STATES.WAITING || room.gameState === GAME_STATES.SHOWDOWN) return;
+    const seconds = Math.round(TURN_REMINDER_MS / 1000);
+    io.to(room.code).emit('actionReminder', {
+      playerId: player.id,
+      playerName: player.name,
+      seconds,
+      message: `${player.name} 已经思考了 ${seconds} 秒，还在等待其行动`
+    });
+  }, TURN_REMINDER_MS);
+}
+
+function stopTurnReminder(room) {
+  if (!room) return;
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    if (room.timers instanceof Set) room.timers.delete(room.turnTimer);
+    room.turnTimer = null;
+  }
+  room.turnDeadline = null;
+}
+
+// 从某个座位号开始，按座位顺序找下一位还能行动的玩家（环形）
+function findNextActor(room, seatNumber) {
+  const candidates = getActivePlayers(room).filter(p => !p.allIn);
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => room.playerSeats.get(a.id) - room.playerSeats.get(b.id));
+  const from = Number.isInteger(seatNumber) ? seatNumber : -1;
+  return candidates.find(p => room.playerSeats.get(p.id) > from) || candidates[0];
+}
+
 // 创建房间
 function createRoom(roomName, hostId, settings) {
   const roomCode = generateRoomCode();
@@ -159,8 +238,12 @@ function createRoom(roomName, hostId, settings) {
     communityCards: [],
     pot: 0,
     currentBet: 0,
-    currentPlayerIndex: 0,
-    dealerIndex: 0,
+    lastRaiseSize: 0,
+    currentPlayerId: null,
+    turnDeadline: null,
+    turnTimer: null,
+    timers: new Set(),
+    dealerIndex: -1,
     smallBlindIndex: 0,
     bigBlindIndex: 0,
     settings: {
@@ -626,7 +709,7 @@ io.on('connection', (socket) => {
         
         // 如果房间为空，删除房间
         if (room.players.size === 0) {
-          rooms.delete(room.code);
+          destroyRoom(room);
         }
         
         console.log(`玩家离开房间 ${room.code}，转回筹码: ${chipResult.transferredChips}`);
@@ -690,7 +773,7 @@ io.on('connection', (socket) => {
       
       // 如果房间为空，删除房间
       if (room.players.size === 0) {
-        rooms.delete(room.code);
+        destroyRoom(room);
       }
       
       players.delete(socket.id);
@@ -819,8 +902,7 @@ io.on('connection', (socket) => {
           p => room.playerSeats.has(p.id) && p.chips > 0
         );
         if (readySeatedPlayers.length >= 2) {
-          setTimeout(() => {
-            if (rooms.get(room.code) !== room) return;
+          scheduleRoomTask(room, () => {
             if (room.gameState === GAME_STATES.WAITING) {
               startNewGame(room);
             }
@@ -929,7 +1011,7 @@ io.on('connection', (socket) => {
         
         // 如果房间为空，删除房间
         if (room.players.size === 0) {
-          rooms.delete(room.code);
+          destroyRoom(room);
         }
       }
       players.delete(socket.id);
@@ -944,10 +1026,12 @@ function startNewGame(room) {
   room.pot = 0;
   room.currentBet = 0;
   room.lastRaise = 0;
+  room.lastRaiseSize = room.settings.bigBlind;
   room.actionCount = 0;
   room.playersActed = new Set();
   room.gameState = GAME_STATES.PRE_FLOP;
-  
+  stopTurnReminder(room);
+
   // 重置玩家状态
   room.players.forEach(player => {
     player.folded = false;
@@ -958,10 +1042,10 @@ function startNewGame(room) {
     player.isWinner = false; // 重置获胜状态
     player.handType = null; // 重置牌型
   });
-  
+
   // 重置本局投入明细（边池计算依赖它）
   room.potContributions = new Map();
-  
+
   // 只有已选择座位、且还有筹码的玩家才能参与游戏（筹码输光的玩家等待补码）
   const seatedPlayers = Array.from(room.players.values()).filter(p => {
     return room.playerSeats.has(p.id) && p.chips > 0;
@@ -973,7 +1057,8 @@ function startNewGame(room) {
   // 有筹码的坐下玩家不足 2 人时不开局，保持等待状态（等待输光的玩家补码）
   if (seatedPlayers.length < 2) {
     room.gameState = GAME_STATES.WAITING;
-    room.currentPlayerIndex = null;
+    room.currentPlayerId = null;
+    stopTurnReminder(room);
     io.to(room.code).emit('roomUpdate', {
       message: '需要至少2名有筹码的玩家才能开始，等待玩家补码',
       players: Array.from(room.players.values()).map(p => getPlayerInfo(p, room))
@@ -991,43 +1076,53 @@ function startNewGame(room) {
     return seatA - seatB;
   });
 
-  // 设置庄家和盲注位置
-  if (!room.dealerIndex) room.dealerIndex = 0;
-  room.dealerIndex = (room.dealerIndex + 1) % seatedPlayers.length;
-  room.smallBlindIndex = (room.dealerIndex + 1) % seatedPlayers.length;
-  room.bigBlindIndex = (room.dealerIndex + 2) % seatedPlayers.length;
-  
-  // Pre-Flop阶段特殊规则：从大盲注左侧的玩家开始行动
-  // 这是因为小盲注和大盲注已经强制下注，需要从下一位玩家开始决策
-  room.currentPlayerIndex = (room.bigBlindIndex + 1) % seatedPlayers.length;
-  
+  // 庄家按钮轮转；两人桌时按钮位就是小盲（标准单挑规则）
+  const playerCount = seatedPlayers.length;
+  const isHeadsUp = playerCount === 2;
+  room.dealerIndex = (Number.isInteger(room.dealerIndex) ? room.dealerIndex + 1 : 0) % playerCount;
+  room.smallBlindIndex = isHeadsUp ? room.dealerIndex : (room.dealerIndex + 1) % playerCount;
+  room.dealerPlayerId = seatedPlayers[room.dealerIndex].id;
+  room.bigBlindIndex = isHeadsUp ? (room.dealerIndex + 1) % playerCount : (room.dealerIndex + 2) % playerCount;
+
   // 发底牌给已选择座位的玩家
   for (let i = 0; i < 2; i++) {
     seatedPlayers.forEach(player => {
       player.cards.push(room.deck.pop());
     });
   }
-  
-  // 下盲注
+
+  // 下盲注（筹码不足时直接全下，避免出现负筹码）
   const smallBlindPlayer = seatedPlayers[room.smallBlindIndex];
   const bigBlindPlayer = seatedPlayers[room.bigBlindIndex];
-  
-  smallBlindPlayer.bet = room.settings.smallBlind;
-  smallBlindPlayer.chips -= room.settings.smallBlind;
-  bigBlindPlayer.bet = room.settings.bigBlind;
-  bigBlindPlayer.chips -= room.settings.bigBlind;
-  
-  addPotContribution(room, smallBlindPlayer.id, room.settings.smallBlind);
-  addPotContribution(room, bigBlindPlayer.id, room.settings.bigBlind);
-  
-  room.pot = room.settings.smallBlind + room.settings.bigBlind;
+  const smallBlindAmount = Math.min(room.settings.smallBlind, smallBlindPlayer.chips);
+  const bigBlindAmount = Math.min(room.settings.bigBlind, bigBlindPlayer.chips);
+
+  smallBlindPlayer.bet = smallBlindAmount;
+  smallBlindPlayer.chips -= smallBlindAmount;
+  bigBlindPlayer.bet = bigBlindAmount;
+  bigBlindPlayer.chips -= bigBlindAmount;
+  if (smallBlindPlayer.chips === 0) smallBlindPlayer.allIn = true;
+  if (bigBlindPlayer.chips === 0) bigBlindPlayer.allIn = true;
+
+  addPotContribution(room, smallBlindPlayer.id, smallBlindAmount);
+  addPotContribution(room, bigBlindPlayer.id, bigBlindAmount);
+
+  room.pot = smallBlindAmount + bigBlindAmount;
   room.currentBet = room.settings.bigBlind;
-  
+  room.lastRaiseSize = room.settings.bigBlind;
+
+  // 翻牌前从大盲左侧第一位能行动的玩家开始（单挑时就是按钮/小盲位）
+  const firstActor = findNextActor(room, room.playerSeats.get(bigBlindPlayer.id));
+  room.currentPlayerId = firstActor ? firstActor.id : null;
+  startTurnReminder(room);
+
   io.to(room.code).emit('gameStarted', {
     gameState: room.gameState,
     pot: room.pot,
     currentBet: room.currentBet,
-    currentPlayer: seatedPlayers[room.currentPlayerIndex].id,
+    lastRaiseSize: room.lastRaiseSize,
+    currentPlayer: room.currentPlayerId,
+    turnDeadline: room.turnDeadline,
     players: seatedPlayers.map(p => getPlayerInfo(p, room)),
     dealerIndex: room.dealerIndex,
     smallBlindIndex: room.smallBlindIndex,
@@ -1039,215 +1134,225 @@ function startNewGame(room) {
       seatNumber: room.playerSeats.get(p.id)
     }))
   });
-  
+
   // 发送底牌给已选择座位的玩家
   seatedPlayers.forEach(player => {
     io.to(player.id).emit('dealCards', { cards: player.cards });
   });
+
+  // 极端情况：盲注直接把所有人打成全下，没有可行动玩家，直接进入下一阶段
+  if (!room.currentPlayerId) {
+    scheduleRoomTask(room, () => {
+      if (room.gameState === GAME_STATES.PRE_FLOP && !room.currentPlayerId) {
+        nextGameStage(room);
+      }
+    }, 0);
+  }
 }
 
-// 处理玩家操作
-async function handlePlayerAction(room, playerId, action, amount = 0) {
-  // 检查玩家是否参与本局游戏
-  if (!room.gameParticipants || !room.gameParticipants.has(playerId)) {
-    return; // 观战玩家不能参与游戏操作
-  }
-  
-  // 获取活跃玩家（按座位号排序）
-  const activePlayers = Array.from(room.players.values())
-    .filter(p => room.gameParticipants.has(p.id) && !p.folded)
-    .sort((a, b) => {
-      const seatA = room.playerSeats.get(a.id);
-      const seatB = room.playerSeats.get(b.id);
-      return seatA - seatB;
-    });
-  const currentPlayer = activePlayers[room.currentPlayerIndex];
-  
-  if (currentPlayer.id !== playerId) {
-    return; // 不是当前玩家的回合
-  }
-  
-  const player = room.players.get(playerId);
-  
-  switch (action) {
-    case 'fold':
-      player.folded = true;
-      break;
-      
-    case 'call':
-      const callAmount = Math.max(0, room.currentBet - player.bet);
-      
-      // 如果没有需要跟注的金额或筹码不足跟注，拒绝操作
-      if (callAmount <= 0 || player.chips < callAmount) {
-        return; // 没有需要跟注或筹码不足，不能跟注
-      }
-      
-      player.bet += callAmount;
-      player.chips -= callAmount;
-      room.pot += callAmount;
-      addPotContribution(room, player.id, callAmount);
-      if (player.chips === 0) player.allIn = true;
-      break;
-      
-    case 'raise':
-      // 计算跟注金额
-      const raiseCallAmount = Math.max(0, room.currentBet - player.bet);
-      // 最小加注额度：至少是大盲注
-      const minRaiseAmount = room.settings.bigBlind;
-      // 总的最小下注额度 = 跟注 + 最小加注
-      const minTotalAmount = raiseCallAmount + minRaiseAmount;
-      
-      // 如果筹码不足最小加注要求，拒绝操作
-      if (player.chips < minTotalAmount) {
-        return; // 筹码不足，不能加注
-      }
-      
-      // 实际加注金额不能少于最小加注
-      const actualAmount = Math.max(minTotalAmount, amount);
-      const totalAmount = Math.min(actualAmount, player.chips);
-      const newTotalBet = player.bet + totalAmount;
-      
-      if (newTotalBet > room.currentBet) {
-        room.lastRaise = room.currentBet;
-        room.currentBet = newTotalBet;
-      }
-      player.chips -= totalAmount;
-      player.bet += totalAmount;
-      room.pot += totalAmount;
-      addPotContribution(room, player.id, totalAmount);
-      if (player.chips === 0) player.allIn = true;
-      break;
-      
-    case 'check':
-      // 不需要额外操作
-      break;
-      
-    case 'allIn':
-      const allInAmount = player.chips;
-      const newBetTotal = player.bet + allInAmount;
-      
-      // 如果全下金额超过当前下注，视为加注
-      if (newBetTotal > room.currentBet) {
-        room.lastRaise = room.currentBet;
-        room.currentBet = newBetTotal;
-      }
-      
-      room.pot += allInAmount;
-      addPotContribution(room, player.id, allInAmount);
-      player.bet += allInAmount;
-      player.chips = 0;
-      player.allIn = true;
-      break;
-  }
-  
-  // 记录玩家行动
-  if (!room.playersActed) room.playersActed = new Set();
-  room.playersActed.add(playerId);
-  
-  // 增加行动计数
-  if (!room.actionCount) room.actionCount = 0;
-  room.actionCount++;
-  
-  // 如果有加注或全下超过当前下注，重置行动记录（所有玩家需要重新行动）
-  if (action === 'raise' || (action === 'allIn' && player.bet > room.lastRaise)) {
-    room.playersActed.clear();
-    room.playersActed.add(playerId); // 当前玩家已经行动
-    room.actionCount = 1; // 重置为1，因为当前玩家已经行动
-  }
-  
-  // 移动到下一个玩家
-  moveToNextPlayer(room);
-  
-  // 检查是否只剩一个未弃牌的玩家
-  const remainingPlayers = Array.from(room.players.values())
-    .filter(p => room.gameParticipants.has(p.id) && !p.folded)
-    .sort((a, b) => {
-      const seatA = room.playerSeats.get(a.id);
-      const seatB = room.playerSeats.get(b.id);
-      return seatA - seatB;
-    });
-  
-  if (remainingPlayers.length === 1) {
-    // 只剩一个玩家，直接结束游戏
-    showdown(room);
-    return;
-  }
-  
-  // 同步筹码变化到数据库
-  try {
-    const playerData = players.get(playerId);
-    if (playerData && playerData.userId) {
-      const player = room.players.get(playerId);
-      await chipService.updateRoomChips(playerData.userId, room.code, player.chips);
-    }
-  } catch (error) {
-    console.error('同步筹码错误:', error);
-  }
-  
-  // 广播游戏状态
-  io.to(room.code).emit('gameStateUpdate', {
+// 构建下注轮状态快照（用于广播与非法操作回执）
+function buildGameStatePayload(room, action) {
+  const payload = {
     pot: room.pot,
     currentBet: room.currentBet,
-    currentPlayer: getCurrentPlayer(room)?.id,
-    players: remainingPlayers.map(p => getPlayerInfo(p, room)),
+    lastRaiseSize: room.lastRaiseSize,
+    currentPlayer: room.currentPlayerId,
+    turnDeadline: room.turnDeadline,
+    players: getActivePlayers(room).map(p => getPlayerInfo(p, room)),
     allPlayers: Array.from(room.players.values()).map(p => getPlayerInfo(p, room)),
     gameParticipants: Array.from(room.gameParticipants || []),
-    action: { playerId, action, amount },
     dealerIndex: room.dealerIndex,
     smallBlindIndex: room.smallBlindIndex,
     bigBlindIndex: room.bigBlindIndex,
     bigBlind: room.settings.bigBlind,
     smallBlind: room.settings.smallBlind
-  });
-  
-  // 检查是否需要进入下一阶段
+  };
+  if (action) payload.action = action;
+  return payload;
+}
+
+// 拒绝非法操作：只回执给该玩家，并同步一次最新状态
+function rejectAction(room, playerId, reason) {
+  io.to(playerId).emit('actionRejected', { reason });
+  io.to(playerId).emit('gameStateUpdate', buildGameStatePayload(room));
+}
+
+// 处理玩家操作
+async function handlePlayerAction(room, playerId, action, amount = 0) {
+  if (!room) return;
+
+  if (room.gameState !== GAME_STATES.PRE_FLOP && room.gameState !== GAME_STATES.FLOP &&
+      room.gameState !== GAME_STATES.TURN && room.gameState !== GAME_STATES.RIVER) {
+    return rejectAction(room, playerId, '当前不在下注轮，请稍候');
+  }
+
+  if (!room.gameParticipants || !room.gameParticipants.has(playerId)) {
+    return rejectAction(room, playerId, '观战中，不能参与本局操作');
+  }
+
+  const player = room.players.get(playerId);
+  if (!player) return;
+  if (player.folded) return rejectAction(room, playerId, '你已弃牌，本局无法再行动');
+  if (player.allIn) return rejectAction(room, playerId, '你已全下，等待其他玩家行动');
+  if (room.currentPlayerId !== playerId) {
+    const current = room.players.get(room.currentPlayerId);
+    return rejectAction(room, playerId, current ? `还没轮到你，当前是 ${current.name} 行动` : '还没轮到你行动');
+  }
+
+  const callAmount = Math.max(0, room.currentBet - player.bet);
+  let appliedAction = action;
+  let appliedAmount = 0;
+  let fullRaise = false;
+
+  switch (action) {
+    case 'fold':
+      player.folded = true;
+      break;
+
+    case 'check':
+      if (callAmount > 0) {
+        return rejectAction(room, playerId, `当前有 ${callAmount} 筹码需要跟注，不能过牌`);
+      }
+      break;
+
+    case 'call': {
+      if (callAmount <= 0) {
+        return rejectAction(room, playerId, '当前无需跟注，请选择过牌');
+      }
+      const payAmount = Math.min(callAmount, player.chips);
+      if (payAmount <= 0) return rejectAction(room, playerId, '筹码不足，无法跟注');
+      player.chips -= payAmount;
+      player.bet += payAmount;
+      room.pot += payAmount;
+      addPotContribution(room, player.id, payAmount);
+      appliedAmount = payAmount;
+      if (player.chips === 0) {
+        player.allIn = true;
+        appliedAction = 'allIn';
+      }
+      break;
+    }
+
+    case 'raise': {
+      const requested = Number(amount);
+      if (!Number.isFinite(requested) || Math.floor(requested) !== requested || requested <= 0) {
+        return rejectAction(room, playerId, '加注金额无效');
+      }
+      if (requested > player.chips) {
+        return rejectAction(room, playerId, '加注金额超过你的筹码，请选择全下');
+      }
+      const newBet = player.bet + requested;
+      if (newBet <= room.currentBet) {
+        return rejectAction(room, playerId, `加注后需要大于当前下注 ${room.currentBet}`);
+      }
+      const isAllInRaise = requested === player.chips;
+      const minNewBet = room.currentBet + room.lastRaiseSize;
+      if (newBet < minNewBet && !isAllInRaise) {
+        return rejectAction(room, playerId, `最小加注到 ${minNewBet}（本次需投入 ${minNewBet - player.bet}）`);
+      }
+      const raiseIncrement = newBet - room.currentBet;
+      player.chips -= requested;
+      player.bet = newBet;
+      room.pot += requested;
+      addPotContribution(room, player.id, requested);
+      room.currentBet = newBet;
+      appliedAmount = requested;
+      if (raiseIncrement >= room.lastRaiseSize) {
+        room.lastRaiseSize = raiseIncrement;
+        fullRaise = true;
+      }
+      if (player.chips === 0) {
+        player.allIn = true;
+        appliedAction = 'allIn';
+      }
+      break;
+    }
+
+    case 'allIn': {
+      if (player.chips <= 0) return rejectAction(room, playerId, '你已没有筹码可以全下');
+      const allInAmount = player.chips;
+      const newBet = player.bet + allInAmount;
+      player.chips = 0;
+      player.bet = newBet;
+      room.pot += allInAmount;
+      addPotContribution(room, player.id, allInAmount);
+      player.allIn = true;
+      appliedAmount = allInAmount;
+      if (newBet > room.currentBet) {
+        const raiseIncrement = newBet - room.currentBet;
+        if (raiseIncrement >= room.lastRaiseSize) {
+          room.lastRaiseSize = raiseIncrement;
+          fullRaise = true;
+        }
+        room.currentBet = newBet;
+      }
+      break;
+    }
+
+    default:
+      return rejectAction(room, playerId, '未知操作');
+  }
+
+  // 记录行动：完整加注后所有玩家需要重新行动；短 all-in 不重开行动
+  if (!room.playersActed) room.playersActed = new Set();
+  if (fullRaise) room.playersActed.clear();
+  room.playersActed.add(playerId);
+
+  stopTurnReminder(room);
+
+  // 同步筹码变化到数据库
+  try {
+    const playerData = players.get(playerId);
+    if (playerData && playerData.userId) {
+      await chipService.updateRoomChips(playerData.userId, room.code, player.chips);
+    }
+  } catch (error) {
+    console.error('同步筹码错误:', error);
+  }
+
+  // 只剩一个未弃牌的玩家，直接结算
+  if (getActivePlayers(room).length === 1) {
+    await showdown(room);
+    return;
+  }
+
+  // 本轮下注结束则进入下一阶段（nextGameStage 会重设当前玩家和提醒）
   if (isRoundComplete(room)) {
     nextGameStage(room);
+    return;
   }
+
+  // 轮到下一个能行动的玩家
+  const nextPlayer = findNextActor(room, room.playerSeats.get(playerId));
+  room.currentPlayerId = nextPlayer ? nextPlayer.id : null;
+  if (room.currentPlayerId) {
+    startTurnReminder(room);
+  }
+
+  io.to(room.code).emit('gameStateUpdate', buildGameStatePayload(room, {
+    playerId,
+    action: appliedAction,
+    amount: appliedAmount
+  }));
 }
 
 // 移动到下一个玩家
 function moveToNextPlayer(room) {
-  // 获取活跃玩家（按座位号排序）
-  const activePlayers = Array.from(room.players.values())
-    .filter(p => room.gameParticipants.has(p.id) && !p.folded)
-    .sort((a, b) => {
-      const seatA = room.playerSeats.get(a.id);
-      const seatB = room.playerSeats.get(b.id);
-      return seatA - seatB;
-    });
-  
-  const playersCanAct = activePlayers.filter(p => !p.allIn);
-  
-  if (playersCanAct.length === 0) return; // 所有玩家都全下了
-  
-  // 移动到下一个可以行动的玩家
-  let attempts = 0;
-  const maxAttempts = activePlayers.length;
-  
-  do {
-    room.currentPlayerIndex = (room.currentPlayerIndex + 1) % activePlayers.length;
-    attempts++;
-    
-    // 防止无限循环
-    if (attempts >= maxAttempts) {
-      break;
-    }
-  } while (activePlayers[room.currentPlayerIndex] && 
-           (activePlayers[room.currentPlayerIndex].folded || activePlayers[room.currentPlayerIndex].allIn));
+  const fromSeat = room.playerSeats.get(room.currentPlayerId);
+  const nextPlayer = findNextActor(room, Number.isInteger(fromSeat) ? fromSeat : -1);
+  room.currentPlayerId = nextPlayer ? nextPlayer.id : null;
+  if (room.currentPlayerId) {
+    startTurnReminder(room);
+  } else {
+    stopTurnReminder(room);
+  }
+  return room.currentPlayerId;
 }
 
 // 获取当前玩家
 function getCurrentPlayer(room) {
-  // 获取活跃玩家（按座位号排序）
-  const activePlayers = Array.from(room.players.values())
-    .filter(p => room.gameParticipants.has(p.id) && !p.folded)
-    .sort((a, b) => {
-      const seatA = room.playerSeats.get(a.id);
-      const seatB = room.playerSeats.get(b.id);
-      return seatA - seatB;
-    });
-  return activePlayers[room.currentPlayerIndex];
+  if (!room || !room.currentPlayerId) return null;
+  return room.players.get(room.currentPlayerId) || null;
 }
 
 // 检查回合是否完成
@@ -1286,73 +1391,61 @@ function isRoundComplete(room) {
 
 // 进入下一游戏阶段
 function nextGameStage(room) {
-  // 重置当前轮下注（累计投入已由 room.potContributions 实时记录）
+  // 进入新阶段：清空本轮下注，重置最小加注额为一个大盲
   room.players.forEach(player => {
     player.bet = 0;
   });
   room.currentBet = 0;
   room.lastRaise = 0;
+  room.lastRaiseSize = room.settings.bigBlind;
   room.actionCount = 0;
   room.playersActed = new Set();
-  
-  // 获取活跃玩家（按座位号排序）
-  const activePlayers = Array.from(room.players.values())
-    .filter(p => room.gameParticipants.has(p.id) && !p.folded)
-    .sort((a, b) => {
-      const seatA = room.playerSeats.get(a.id);
-      const seatB = room.playerSeats.get(b.id);
-      return seatA - seatB;
-    });
-  
+  room.currentPlayerId = null;
+  stopTurnReminder(room);
+
+  const activePlayers = getActivePlayers(room);
   const playersCanAct = activePlayers.filter(p => !p.allIn);
-  
+
   // 如果没有玩家能继续行动（所有玩家都全下或只剩一个能行动的玩家），直接跳到摊牌并发出所有剩余公共牌
   if (playersCanAct.length <= 1 && activePlayers.length > 1) {
-    // 发出所有剩余的公共牌
     while (room.communityCards.length < 5 && room.deck.length > 0) {
       room.communityCards.push(room.deck.pop());
     }
-    
+
     room.gameState = GAME_STATES.SHOWDOWN;
-    
-    // 通知客户端所有剩余公共牌已发出
+
     io.to(room.code).emit('allInShowdown', {
       gameState: room.gameState,
       communityCards: room.communityCards,
       message: '所有玩家全下，直接摊牌'
     });
-    
-    // 直接进入摊牌
+
     showdown(room);
     return;
   }
-  
+
   // 正常的游戏阶段转换
   switch (room.gameState) {
     case GAME_STATES.PRE_FLOP:
       room.gameState = GAME_STATES.FLOP;
-      // 发3张公共牌
       for (let i = 0; i < 3; i++) {
         room.communityCards.push(room.deck.pop());
       }
       break;
-      
+
     case GAME_STATES.FLOP:
       room.gameState = GAME_STATES.TURN;
-      // 发1张公共牌
       room.communityCards.push(room.deck.pop());
       break;
-      
+
     case GAME_STATES.TURN:
       room.gameState = GAME_STATES.RIVER;
-      // 发1张公共牌
       room.communityCards.push(room.deck.pop());
       break;
-      
-    case GAME_STATES.RIVER:
+
+    case GAME_STATES.RIVER: {
       room.gameState = GAME_STATES.SHOWDOWN;
-      
-      // 先通知客户端进入摊牌阶段，显示手牌
+
       const showdownData = {
         gameState: room.gameState,
         communityCards: room.communityCards,
@@ -1360,79 +1453,67 @@ function nextGameStage(room) {
         smallBlindIndex: room.smallBlindIndex,
         bigBlindIndex: room.bigBlindIndex
       };
-      
-      // 发送所有参与游戏玩家的手牌
-      const gameParticipants = Array.from(room.players.values())
+
+      showdownData.playerCards = Array.from(room.players.values())
         .filter(p => room.gameParticipants.has(p.id))
         .map(p => ({
           playerId: p.id,
           cards: p.cards
         }));
-      showdownData.playerCards = gameParticipants;
-      
+
       io.to(room.code).emit('nextStage', showdownData);
-      
-      // 延时1秒后进行摊牌计算和结果显示
-      setTimeout(() => {
-        showdown(room);
-      }, 1000);
+
+      // 延时1秒后进行摊牌计算和结果显示（定时器登记在房间上，离房时会清理）
+      scheduleRoomTask(room, () => showdown(room), 1000);
       return;
+    }
   }
-  
-  // 设置下注顺序：Flop/Turn/River阶段从庄家左侧第一个存活玩家开始
-  setCurrentPlayerForNewStage(room, activePlayers);
-  
-  // 准备发送的数据
+
+  // 翻牌/转牌/河牌：从庄家左侧第一位能行动的玩家开始
+  setCurrentPlayerForNewStage(room);
+
   const stageData = {
     gameState: room.gameState,
     communityCards: room.communityCards,
-    currentPlayer: activePlayers[room.currentPlayerIndex]?.id,
+    currentPlayer: room.currentPlayerId,
+    turnDeadline: room.turnDeadline,
+    lastRaiseSize: room.lastRaiseSize,
     dealerIndex: room.dealerIndex,
     smallBlindIndex: room.smallBlindIndex,
     bigBlindIndex: room.bigBlindIndex
   };
-  
+
   // 如果是翻牌阶段及之后，发送所有参与游戏玩家的手牌
   if (room.gameState !== GAME_STATES.PRE_FLOP) {
-    const gameParticipants = Array.from(room.players.values())
+    stageData.playerCards = Array.from(room.players.values())
       .filter(p => room.gameParticipants.has(p.id))
       .map(p => ({
         playerId: p.id,
         cards: p.cards
       }));
-    stageData.playerCards = gameParticipants;
   }
-  
+
   io.to(room.code).emit('nextStage', stageData);
 }
 
-// 为新阶段设置当前玩家（Flop/Turn/River从庄家左侧开始）
-function setCurrentPlayerForNewStage(room, activePlayers) {
-  // Flop/Turn/River阶段规则：从庄家左侧第一个存活玩家开始行动
-  // 这与Pre-Flop不同，Pre-Flop是从大盲注左侧开始
-  
-  // 找到庄家在活跃玩家中的索引
-  const dealerPlayerIndex = activePlayers.findIndex(p => {
-    const playerSeat = room.playerSeats.get(p.id);
-    const dealerSeat = Array.from(room.players.values())
-      .filter(player => room.gameParticipants.has(player.id))
-      .sort((a, b) => {
-        const seatA = room.playerSeats.get(a.id);
-        const seatB = room.playerSeats.get(b.id);
-        return seatA - seatB;
-      })[room.dealerIndex];
-    return playerSeat === room.playerSeats.get(dealerSeat.id);
-  });
-  
-  // 从庄家左侧第一个存活且能行动的玩家开始
-  let startIndex = (dealerPlayerIndex + 1) % activePlayers.length;
-  
-  // 找到第一个能行动的玩家（跳过全下玩家）
-  while (activePlayers[startIndex] && activePlayers[startIndex].allIn) {
-    startIndex = (startIndex + 1) % activePlayers.length;
+// 为新阶段设置当前玩家（Flop/Turn/River 从庄家左侧第一位能行动的玩家开始）
+function setCurrentPlayerForNewStage(room) {
+  const participants = Array.from(room.players.values())
+    .filter(p => room.gameParticipants && room.gameParticipants.has(p.id))
+    .sort((a, b) => room.playerSeats.get(a.id) - room.playerSeats.get(b.id));
+
+  const dealerPlayer = room.dealerPlayerId
+    ? participants.find(p => p.id === room.dealerPlayerId) || participants[room.dealerIndex]
+    : participants[room.dealerIndex];
+  const dealerSeat = dealerPlayer ? room.playerSeats.get(dealerPlayer.id) : -1;
+  const nextPlayer = findNextActor(room, dealerSeat);
+
+  room.currentPlayerId = nextPlayer ? nextPlayer.id : null;
+  if (room.currentPlayerId) {
+    startTurnReminder(room);
+  } else {
+    stopTurnReminder(room);
   }
-  
-  room.currentPlayerIndex = startIndex;
 }
 
 // 摊牌
@@ -1562,7 +1643,10 @@ async function finishGame(room) {
         await chipService.updateRoomChips(playerData.userId, room.code, player.chips);
       }
     } catch (error) {
-      console.error('同步玩家筹码错误:', error);
+      // 玩家可能已经离桌，筹码已随退房结算，跳过即可
+      if (!/不在该房间内/.test(error.message)) {
+        console.error('同步玩家筹码错误:', error);
+      }
     }
 
     if (player.chips <= 0) {
@@ -1591,6 +1675,8 @@ async function finishGame(room) {
   }
 
   // 重置游戏状态
+  room.currentPlayerId = null;
+  stopTurnReminder(room);
   room.gameState = GAME_STATES.WAITING;
   room.communityCards = [];
   room.pot = 0;
@@ -1607,8 +1693,7 @@ async function finishGame(room) {
     p => room.playerSeats.has(p.id) && p.chips > 0
   );
   if (readySeatedPlayers.length >= 2) {
-    setTimeout(() => {
-      if (rooms.get(room.code) !== room) return;
+    scheduleRoomTask(room, () => {
       if (room.gameState === GAME_STATES.WAITING) {
         console.log(`房间 ${room.code} 游戏结束后自动开始新游戏，有筹码的坐下玩家数: ${readySeatedPlayers.length}`);
         startNewGame(room);
@@ -1738,7 +1823,9 @@ async function continueGame(room) {
   io.to(room.code).emit('gameStateUpdate', {
     pot: room.pot,
     currentBet: room.currentBet,
+    lastRaiseSize: room.lastRaiseSize,
     currentPlayer: getCurrentPlayer(room)?.id,
+    turnDeadline: room.turnDeadline,
     players: getActivePlayers(room).map(p => getPlayerInfo(p, room)),
     allPlayers: Array.from(room.players.values()).map(p => getPlayerInfo(p, room)),
     gameParticipants: Array.from(room.gameParticipants || []),

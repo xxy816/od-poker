@@ -26,8 +26,9 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: '请输入用户名' });
     }
 
-    if (username.length < 2 || username.length > 20) {
-      return res.status(400).json({ error: '用户名长度需为 2-20 个字符' });
+    // 只允许中文、字母、数字、下划线、短横线，避免昵称注入 HTML
+    if (!/^[\w\u4e00-\u9fa5-]{2,20}$/.test(username)) {
+      return res.status(400).json({ error: '用户名需为 2-20 位中文、字母、数字、下划线或短横线' });
     }
 
     let user = await User.findOne({ username });
